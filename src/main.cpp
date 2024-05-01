@@ -443,25 +443,179 @@ std::vector<uint32_t> get_neighbors(uint32_t index, int width, int height)
     return res;
 }
 
-int main()
+template <typename T>
+std::vector<T> copyToHostVec(T* device_buffer,int num)
 {
-    //generate_and_store_random_img2D("random4096x4096_scaled.png", 4096, 4096);
-    //return 0;
-    int width, height;
-    float* data = load_float32_img2D("random4096x4096_scaled.png", &width, &height);
-    /*int width = 1024;
-    int height = 1024;
-    float* data = new float[width * height];
-    for (int j = 0; j < height; ++j) {
-        for (int i = 0; i < width; ++i) {
-            data[j * width + i]= std::pow(float(j - height / 2), 2) + std::pow(float(i - width / 2), 2);//distribution(gen);
-        }
-    }*/
+    std::vector<T> vec(num);
+    cudaMemcpy(vec.data(), device_buffer, sizeof(T) * num, cudaMemcpyDeviceToHost);
+    return vec;
+}
 
+void buildMergeTreeGPUP(const std::vector<PPPVertex>& ppp_vertices, const std::vector<PPPEdge> & ppp_edges)
+{
+    int* unconverge_counter;
+    cudaMalloc((void**)&unconverge_counter, sizeof(int));
+    cudaMemset(unconverge_counter, 0, sizeof(int));
+
+    int numofVertices = ppp_vertices.size();
+    int numofEdges = ppp_edges.size();
+
+    // ping pong buffer
+    PPPVertex* d_ppp_vertices_ping_pong[2];
+    PPPEdge* d_ppp_edges_ping_pong[2];
+    int* d_aux_labels;
+
+    CUDA_CHECK(cudaMalloc((void**)&d_ppp_vertices_ping_pong[0], numofVertices * sizeof(PPPVertex)));
+    CUDA_CHECK(cudaMalloc((void**)&d_ppp_edges_ping_pong[0], numofEdges * sizeof(PPPEdge)));
+    CUDA_CHECK(cudaMalloc((void**)&d_ppp_vertices_ping_pong[1], numofVertices * sizeof(PPPVertex)));
+    CUDA_CHECK(cudaMalloc((void**)&d_ppp_edges_ping_pong[1], numofEdges * sizeof(PPPEdge)));
+
+    CUDA_CHECK(cudaMalloc((void**)&d_aux_labels, numofVertices * sizeof(int)));
+    cudaMemcpy(d_ppp_vertices_ping_pong[0], ppp_vertices.data(), numofVertices * sizeof(PPPVertex), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_ppp_edges_ping_pong[0], ppp_edges.data(), numofEdges * sizeof(PPPEdge), cudaMemcpyHostToDevice);
+
+    int collected_pair_sets_offset = 0;
+    PPPPeakSadlePair* collected_pair_sets;
+    CUDA_CHECK(cudaMalloc((void**)&collected_pair_sets, numofEdges * sizeof(PPPPeakSadlePair)));
+
+    PPPLabelIndex* d_label_indices;
+    int* d_flags1;
+    int* d_flags2;
+
+    CUDA_CHECK(cudaMalloc((void**)&d_label_indices, numofVertices * sizeof(PPPLabelIndex)));
+    CUDA_CHECK(cudaMalloc((void**)&d_flags1, numofVertices * sizeof(int)));
+    CUDA_CHECK(cudaMalloc((void**)&d_flags2, numofVertices * sizeof(int)));
+
+    int* d_neighbor_labels = NULL;
+    int* d_is_saddle_candidate = NULL;
+    int* d_is_saddle_candidate_edge = NULL;
+
+    CUDA_CHECK(cudaMalloc((void**)&d_neighbor_labels, numofVertices * sizeof(int)));
+    CUDA_CHECK(cudaMalloc((void**)&d_is_saddle_candidate, numofVertices * sizeof(int)));
+    CUDA_CHECK(cudaMalloc((void**)&d_is_saddle_candidate_edge, numofEdges * sizeof(int)));
+
+    PPPEdge* d_compacted_edges = NULL;
+    CUDA_CHECK(cudaMalloc((void**)&d_compacted_edges, numofEdges * sizeof(PPPEdge)));
+
+    int* d_vertices_should_remain;
+    int* d_edges_should_remain;
+    CUDA_CHECK(cudaMalloc((void**)&d_vertices_should_remain, numofVertices * sizeof(int)));
+    CUDA_CHECK(cudaMalloc((void**)&d_edges_should_remain, numofEdges * sizeof(int)));
+
+    int* d_vet_remain_scan = nullptr;
+    int* d_vet_reorder_map = nullptr;
+
+    CUDA_CHECK(cudaMalloc((void**)&d_vet_remain_scan, numofVertices * sizeof(int)));
+    CUDA_CHECK(cudaMalloc((void**)&d_vet_reorder_map, numofVertices * sizeof(int)));
+
+    int peak_count = 0;
+    int ping_pong_buf_idx = 0;
+    int iteration = 0;
+    do
+    {
+        printf("\n-------------------- iteration %d --------------------\n", iteration++);
+        PPPVertex* d_ppp_vertices = d_ppp_vertices_ping_pong[ping_pong_buf_idx];
+        PPPEdge* d_ppp_edges = d_ppp_edges_ping_pong[ping_pong_buf_idx];
+        /*auto debug_vertices = copyToHostVec(d_ppp_vertices, numofVertices);
+        auto debug_edges = copyToHostVec(d_ppp_edges, numofEdges);*/
+
+        assign_init_label(d_ppp_edges, d_ppp_vertices, numofEdges);
+
+        printf(" point jump start\n");
+        int last_uncoverge_count = 0;
+        int h_unconverge_counter = 0;
+        do {
+            cudaMemset(unconverge_counter, 0, sizeof(int));
+            pointer_jump(d_ppp_vertices, d_aux_labels, numofVertices, unconverge_counter);
+            cudaMemcpy((void*)&h_unconverge_counter, unconverge_counter, sizeof(int), cudaMemcpyDeviceToHost);
+            assert(last_uncoverge_count != h_unconverge_counter);
+            printf("  %d,", h_unconverge_counter);
+            last_uncoverge_count = h_unconverge_counter;
+        } while (h_unconverge_counter != 0);
+        printf("\n point jump end\n");
+
+        count_peaks(d_ppp_vertices, d_label_indices, d_flags1, d_flags2, numofVertices, &peak_count);
+        printf("Found %d peaks\n", peak_count);
+
+        if (peak_count == 1)
+        {
+            // construct the trunk
+            break;
+        }
+
+        int* d_compact_labels_map = nullptr;
+        CUDA_CHECK(cudaMalloc((void**)&d_compact_labels_map, peak_count * sizeof(int)));
+
+        assign_compact_peak_label(d_ppp_vertices, d_label_indices, d_flags2, d_compact_labels_map, numofVertices);
+        cudaMemset(d_is_saddle_candidate, 0, numofVertices * sizeof(int));
+        cudaMemset(d_neighbor_labels, -1, numofVertices * sizeof(int));
+        identify_saddle_candidate(d_ppp_edges, d_ppp_vertices, d_neighbor_labels, d_is_saddle_candidate, numofEdges);
+        identify_saddle_candidate_edge(d_ppp_edges, d_is_saddle_candidate, d_is_saddle_candidate_edge, numofEdges);
+        //partition all the edges whose lower end is candidate saddle point
+        int* d_num_selected_out = NULL;
+        cudaMalloc((void**)&d_num_selected_out, sizeof(int));
+
+        partition_saddle_candidate_edges(d_ppp_edges, d_compacted_edges, d_is_saddle_candidate_edge, numofEdges, d_num_selected_out);
+
+        int num_selected_out = 0;
+        cudaMemcpy(&num_selected_out, d_num_selected_out, sizeof(int), cudaMemcpyDeviceToHost);
+
+        printf("Found candidate saddle edge num : %d\n", num_selected_out);
+
+        sort_saddle_candidate_edges(d_compacted_edges, d_ppp_vertices, num_selected_out);
+
+        // peak-saddle pairs store the index of governing saddle at the corresponding compacted peak label index
+        int* d_peak_saddle_pairs;
+        CUDA_CHECK(cudaMalloc((void**)&d_peak_saddle_pairs, peak_count * sizeof(int)));
+
+        int saddle_pair_count = 0;
+        identify_governing_saddle(d_compacted_edges, d_ppp_vertices, d_peak_saddle_pairs, num_selected_out, &saddle_pair_count);
+        printf("Found governing saddle pair: %d\n", saddle_pair_count);
+
+        collect_saddle_pairs(d_ppp_vertices, d_compact_labels_map, d_peak_saddle_pairs, collected_pair_sets,saddle_pair_count,collected_pair_sets_offset);
+        collected_pair_sets_offset += saddle_pair_count;
+
+        CUDA_CHECK(cudaMemset((void*)d_vertices_should_remain, 0, numofVertices * sizeof(int)));
+        CUDA_CHECK(cudaMemset((void*)d_edges_should_remain, 0, numofEdges * sizeof(int)));
+
+        mark_delete_region(d_ppp_vertices, d_ppp_edges, d_peak_saddle_pairs, d_vertices_should_remain, d_edges_should_remain, numofVertices, numofEdges);
+
+        CUDA_CHECK(cudaMemset((void*)d_vet_remain_scan, 0, numofVertices * sizeof(int)));
+        CUDA_CHECK(cudaMemset((void*)d_vet_reorder_map, 0, numofVertices * sizeof(int)));
+        //vet_reoder_map encode the new idx for each vertices, which is useful for edge redirecting
+
+        int remain_v_size = 0;
+        int remain_e_size = 0;
+        flatten_vertices_and_edges(d_ppp_vertices, d_ppp_edges,
+            d_ppp_vertices_ping_pong[1 - ping_pong_buf_idx], d_ppp_edges_ping_pong[1 - ping_pong_buf_idx],
+            d_vertices_should_remain, d_edges_should_remain, d_vet_remain_scan,
+            d_vet_reorder_map, numofVertices, numofEdges, &remain_v_size, &remain_e_size);
+
+        redirect_edges(d_ppp_edges_ping_pong[1 - ping_pong_buf_idx], d_vertices_should_remain, d_vet_reorder_map, d_peak_saddle_pairs, remain_e_size);
+
+        cudaFree(d_num_selected_out);
+        cudaFree(d_compact_labels_map);
+        cudaFree(d_peak_saddle_pairs);
+
+        ping_pong_buf_idx = (ping_pong_buf_idx + 1) % 2;
+
+        printf("reduced vertices : %d, reduced edges  : %d\n", numofVertices - remain_v_size, numofEdges - remain_e_size);
+        numofVertices = remain_v_size;
+        numofEdges = remain_e_size;
+        printf("remain vertices : %d, remain edges  : %d\n", numofVertices, numofEdges);
+
+        // When peak count is only 1, then we meet that trunk of merge tree
+    } while (peak_count > 1);
+
+    printf("%d",collected_pair_sets_offset);
+}
+
+void buildCTGPU(int width, int height, const std::vector<float> & data)
+{
     // Extract domain...
-    // Build simplical complex upon a 2D image
-    // In this case we guaranteed that critical points only exist on vertices point,
-    // So it's sufficient to only check vertices
+   // Build simplical complex upon a 2D image
+   // In this case we guaranteed that critical points only exist on vertices point,
+   // So it's sufficient to only check vertices
     uint32_t vertices_count = width * height;
     uint32_t* indices = new uint32_t[vertices_count];
     std::iota(indices, indices + vertices_count, 0);
@@ -470,6 +624,7 @@ int main()
     for (int i = 0; i < vertices_count; i++)
     {
         PPPVertex v;
+        v.identifier = i; // the identifier is global and permanent
         v.peak_label = i;
         v.val = data[i];
         ppp_vertices.push_back(v);
@@ -494,145 +649,69 @@ int main()
         }
     }
 
-    for (int i = 0; i + width + 1 < vertices_count; i++)
+    for (int i = 0; i < height - 1; i++)
     {
-        ppp_edges.push_back({ i,i + width + 1 });
+        for (int j = 0; j < width - 1; j++)
+        {
+            int start = i * width;
+            ppp_edges.push_back({ start + j, start + j + width + 1 });
+        }
     }
 
-    int* unified_counter;
-    cudaMallocManaged(&unified_counter, 1);
-    *unified_counter = 0;
-
-    int numofVertices = ppp_vertices.size();
-    int numofEdges = ppp_edges.size();
-
-    // ping pong buffer
-    PPPVertex* d_ppp_vertices[2];
-    PPPEdge* d_ppp_edges[2];
-    int* d_aux_labels;
-
-    CUDA_CHECK(cudaMalloc((void**)&d_ppp_vertices[0], numofVertices * sizeof(PPPVertex)));
-    CUDA_CHECK(cudaMalloc((void**)&d_ppp_edges[0], numofEdges * sizeof(PPPEdge)));
-    CUDA_CHECK(cudaMalloc((void**)&d_ppp_vertices[1], numofVertices * sizeof(PPPVertex)));
-    CUDA_CHECK(cudaMalloc((void**)&d_ppp_edges[1], numofEdges * sizeof(PPPEdge)));
-
-    CUDA_CHECK(cudaMalloc((void**)&d_aux_labels, numofVertices * sizeof(int)));
-    cudaMemcpy(d_ppp_vertices[0], ppp_vertices.data(), numofVertices * sizeof(PPPVertex), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_ppp_edges[0], ppp_edges.data(), numofEdges * sizeof(PPPEdge), cudaMemcpyHostToDevice);
-
-    PPPLabelIndex* d_label_indices;
-    int* d_flags1;
-    int* d_flags2;
-
-    CUDA_CHECK(cudaMalloc((void**)&d_label_indices, numofVertices * sizeof(PPPLabelIndex)));
-    CUDA_CHECK(cudaMalloc((void**)&d_flags1, numofVertices * sizeof(int)));
-    CUDA_CHECK(cudaMalloc((void**)&d_flags2, numofVertices * sizeof(int)));
-
-    int* d_neighbor_lables = NULL;
-    int* d_is_saddle_candidate = NULL;
-
-    CUDA_CHECK(cudaMalloc((void**)&d_neighbor_lables, numofVertices * sizeof(int)));
-    CUDA_CHECK(cudaMalloc((void**)&d_is_saddle_candidate, numofVertices * sizeof(int)));
-
-    PPPEdge* d_compacted_edges = NULL;
-    CUDA_CHECK(cudaMalloc((void**)&d_compacted_edges, numofEdges * sizeof(PPPEdge)));
-
-    int* d_vertices_should_remain;
-    int* d_edges_should_remain;
-    CUDA_CHECK(cudaMalloc((void**)&d_vertices_should_remain, numofVertices * sizeof(int)));
-    CUDA_CHECK(cudaMalloc((void**)&d_edges_should_remain, numofEdges * sizeof(int)));
-
-    int* d_vet_remain_scan = nullptr;
-    int* d_vet_reorder_map = nullptr;
-
-    CUDA_CHECK(cudaMalloc((void**)&d_vet_remain_scan, numofVertices * sizeof(int)));
-    CUDA_CHECK(cudaMalloc((void**)&d_vet_reorder_map, numofVertices * sizeof(int)));
-
-    int peak_count = 0;
-    int ping_poing_idx = 0;
-    int iteration = 0;
-    do
+#pragma region BuildMergeTree
+    // build join tree
+    buildMergeTreeGPUP(ppp_vertices, ppp_edges);
+    for (int i = 0; i < vertices_count; i++)
     {
-        printf("\n-------------------- iteration %d --------------------\n",iteration++);
-        assign_init_label(d_ppp_edges[ping_poing_idx], d_ppp_vertices[ping_poing_idx], numofEdges);
-        printf(" point jump start\n");
-        int last_uncoverge_count = 0;
-        do{
-            *unified_counter = 0;
-            pointer_jump(d_ppp_vertices[ping_poing_idx], d_aux_labels, numofVertices, unified_counter);
-            assert(last_uncoverge_count != *unified_counter);
-            printf("  %d\n", *unified_counter);
-            last_uncoverge_count = *unified_counter;
-        } while (*unified_counter != 0);
-        printf(" point jump end\n");
+        ppp_vertices[i].val *= -1;
+    }
+    // build split tree
+    buildMergeTreeGPUP(ppp_vertices,ppp_edges);
+#pragma endregion
 
-        count_peaks(d_ppp_vertices[ping_poing_idx], d_label_indices, d_flags1, d_flags2, numofVertices, &peak_count);
-        printf("Found %d peaks\n", peak_count);
+#pragma region BuildContourTree
+    // For contour tree construction the final result is an edges list, whose endpoints are the identifiers of vertex
+    CTEdge* d_ct_edges;
+    // We preallocate the buffer for ct edges, with the worse-case of N-1
+    //CUDA_CHECK(cudaMalloc((void**)&d_ct_edges, numofVertices * sizeof(CTEdge)));
 
-        int* d_compact_labels_map = nullptr;
-        CUDA_CHECK(cudaMalloc((void**)&d_compact_labels_map, (peak_count + 1) * sizeof(int)));
-    
-        assign_compact_peak_label(d_ppp_vertices[ping_poing_idx], d_label_indices, d_flags2, d_compact_labels_map, numofVertices);
+#pragma endregion
+}
 
-        cudaMemset(d_is_saddle_candidate, 0, numofVertices * sizeof(int));
-        cudaMemset(d_neighbor_lables, -1, numofVertices * sizeof(int));
-        identify_saddle_candidate(d_ppp_edges[ping_poing_idx], d_ppp_vertices[ping_poing_idx], d_neighbor_lables, d_is_saddle_candidate, numofEdges);
+int main()
+{
+    //generate_and_store_random_img2D("random4096x4096_scaled.png", 4096, 4096);
+    //return 0;
+    //int width, height;
+    //float* data = load_float32_img2D("random4096x4096_scaled.png", &width, &height);
+    /*int width = 1024;
+    int height = 1024;
+    float* data = new float[width * height];
+    for (int j = 0; j < height; ++j) {
+        for (int i = 0; i < width; ++i) {
+            data[j * width + i]= std::pow(float(j - height / 2), 2) + std::pow(float(i - width / 2), 2);//distribution(gen);
+        }
+    }*/
 
-        //partition all the edges with candidate saddle point as the lower end
-        int* d_num_selected_out = NULL;
-        cudaMalloc((void**)&d_num_selected_out, sizeof(int));
-        
-        partition_saddle_candidate_edges(d_ppp_edges[ping_poing_idx], d_compacted_edges, d_is_saddle_candidate, numofEdges, d_num_selected_out);
-        int num_selected_out;
-        cudaMemcpy(&num_selected_out, d_num_selected_out, sizeof(int), cudaMemcpyDeviceToHost);
+    int width = 256;
+    int height = 256;
+    uint32_t vertices_count = width * height;
+    uint32_t* indices = new uint32_t[vertices_count];
 
-        printf("Found candidate saddle edge num : %d\n", num_selected_out);
+    std::vector<float> data(width*height);
+    for (int i = 0; i < width; i++)
+    {
+        for (int j = 0; j < height; j++)
+        {
+            data[i + width * j] = float(i + width * j) / float(width * height) * 100.0;
+        }
+    }
+    std::random_device rd;
+    std::mt19937 g(rd());
 
-        sort_saddle_candidate_edges(d_compacted_edges, d_ppp_vertices[ping_poing_idx], num_selected_out);
+    std::shuffle(data.begin(), data.end(), g);
 
-       /* std::vector<PPPEdge> sorted_edges;
-        sorted_edges.resize(num_selected_out);
-        cudaMemcpy(sorted_edges.data(), d_compacted_edges, num_selected_out * sizeof(PPPEdge), cudaMemcpyDeviceToHost);*/
-
-        // peak-saddle pairs store the index of govering saddle at the corresponding compacted peak label index
-        int* d_peak_saddle_pairs;
-        CUDA_CHECK(cudaMalloc((void**)&d_peak_saddle_pairs, peak_count * sizeof(int)));
-
-        int saddle_count = 0;
-        identify_governing_saddle(d_compacted_edges, d_ppp_vertices[ping_poing_idx], d_peak_saddle_pairs, num_selected_out, &saddle_count);
-        printf("Found governing saddle : %d\n", saddle_count);
-
-        CUDA_CHECK(cudaMemset((void*)d_vertices_should_remain, 0, numofVertices * sizeof(int)));
-        CUDA_CHECK(cudaMemset((void*)d_edges_should_remain, 0, numofEdges * sizeof(int)));
-
-        mark_delete_region(d_ppp_vertices[ping_poing_idx], d_ppp_edges[ping_poing_idx], d_peak_saddle_pairs, d_vertices_should_remain, d_edges_should_remain, numofVertices, numofEdges);
-
-        CUDA_CHECK(cudaMemset((void*)d_vet_remain_scan, 0, numofVertices * sizeof(int)));
-        CUDA_CHECK(cudaMemset((void*)d_vet_reorder_map, 0, numofVertices * sizeof(int)));
-
-        int remain_v_size = 0;
-        int remain_e_size = 0;
-        flatten_vertices_and_edges(d_ppp_vertices[ping_poing_idx], d_ppp_edges[ping_poing_idx], 
-            d_ppp_vertices[1 - ping_poing_idx], d_ppp_edges[1 - ping_poing_idx], 
-            d_vertices_should_remain, d_edges_should_remain, d_vet_remain_scan,
-            d_vet_reorder_map, numofVertices, numofEdges, &remain_v_size, &remain_e_size);
-
-        printf("remain vertices num : %d, remain edges num : %d\n", remain_v_size, remain_e_size);
-
-        redirect_edges(d_ppp_edges[1 - ping_poing_idx], d_vertices_should_remain, d_vet_reorder_map, d_peak_saddle_pairs, remain_e_size);
-
-        cudaFree(d_num_selected_out);
-        cudaFree(d_compact_labels_map);
-        cudaFree(d_peak_saddle_pairs);
-
-        ping_poing_idx = (ping_poing_idx + 1) % 2;
-        numofVertices = remain_v_size;
-        numofEdges = remain_e_size;
-
-    } while (peak_count > 1);
-
-    // When peak count is only 1, then we meet that trunk of merge tree
-
+    buildCTGPU(width, height, data);
 
     return 0;
 

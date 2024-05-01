@@ -6,6 +6,7 @@
 
 struct PPPVertex
 {
+    int identifier;
     float val;
     int peak_label;
 };
@@ -21,6 +22,12 @@ struct PPPLabelIndex
 {
     int label;
     int idx;
+};
+
+struct PPPPeakSadlePair
+{
+    int peak_id;
+    int saddle_id;
 };
 
 struct PPPLabelIndexComp
@@ -50,6 +57,25 @@ struct PPPEdgeLess
     }
 };
 
+struct MTNode
+{
+    bool is_deleted = false;
+    int degree;
+    int parent_id;
+};
+
+struct MTEdge
+{
+    int id0;
+    int id1;
+};
+
+struct CTEdge
+{
+    int id0;
+    int id1;
+};
+
 void assign_init_label(PPPEdge* edges, PPPVertex* vertices, int size);
 
 void pointer_jump(PPPVertex* d_vertices, int* d_aux_labels, int size, int * d_counter);
@@ -60,11 +86,15 @@ void assign_compact_peak_label(PPPVertex* vertices, PPPLabelIndex* d_label_idx, 
 
 void identify_saddle_candidate(PPPEdge* d_edges, const PPPVertex* d_vertices, int* d_neighbor_labels, int* is_candidate, int size);
 
+void identify_saddle_candidate_edge(PPPEdge* d_edges, const int* is_candidate_vertex, int* is_candidate_edge, int size);
+
 void partition_saddle_candidate_edges(const PPPEdge* d_edges, PPPEdge* out_edges, int* is_candidate, int size, int* selected_out);
 
 void sort_saddle_candidate_edges(PPPEdge* d_edges, const PPPVertex* d_vertices,int size);
 
 void identify_governing_saddle(const PPPEdge* d_candidate_edges, const PPPVertex* d_vertices, int* peak_saddle_pairs, int size, int * saddle_count);
+
+void collect_saddle_pairs(const PPPVertex* d_vertices, const int* compacted_labels_map, const int* peak_saddle_pairs, PPPPeakSadlePair* pairs, int size, int offset);
 
 void mark_delete_region(PPPVertex* d_vertices, PPPEdge* d_edges, const int* d_peak_saddle_pairs, int* d_vet_should_remain, int* d_edge_should_remain, int v_size, int e_size);
 
@@ -75,3 +105,5 @@ void flatten_vertices_and_edges(const PPPVertex* d_vertices, const PPPEdge* d_ed
     int v_size, int e_size, int* remain_v_size, int* remain_e_size);
 
 void redirect_edges(PPPEdge* d_edges, int* d_vet_should_remain, int* d_vet_new_idx_map, const int* d_peak_saddle_pairs, int size);
+
+void transfer_leaves_step(const MTNode* t1_nodes, const MTNode* t2_nodes, const MTEdge* t1_edges, const MTEdge* t2_edges);
